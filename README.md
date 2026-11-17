@@ -47,6 +47,9 @@ Copy the answer
 Initiator:
 Paste the answer
 Click Connect
+
+Both peers then see a SHA-256 fingerprint for the other peer's public key. Compare the fingerprints over a separate trusted channel (for example, a voice call) and only click “I verified this fingerprint” when they match. This manual check is required to reduce man-in-the-middle risk.
+
 4. Start Messaging
 
 Once connected:
@@ -60,8 +63,9 @@ This project is experimental and not audited.
 
 Limitations:
 
-No identity verification (susceptible to MITM attacks)
+Fingerprint verification is manual and only protects against MITM when compared over a trusted separate channel
 No forward secrecy (single session key)
+Files are limited to 25 MB; incoming buffering is bounded
 Metadata (IP, timing, size) is exposed
 
 ⚠️ Do not rely on this for sensitive or high-risk communication.
