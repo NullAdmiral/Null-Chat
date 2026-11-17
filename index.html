@@ -405,6 +405,13 @@ textarea.token-box:focus { border-color: var(--accent); color: var(--text); }
         <button class="action-btn ghost" onclick="copyText('answerBox')">copy answer</button>
       </div>
 
+      <div class="step-block" id="fingerprintSection" style="display:none">
+        <div class="section-label">verify peer fingerprint</div>
+        <div class="token-box" id="fingerprintValue" role="status" aria-live="polite"></div>
+        <div style="font-size:11px;color:var(--text2);line-height:1.5;margin-top:6px">Compare this value with your peer over a separate trusted channel before chatting. A mismatch can mean a man-in-the-middle attack.</div>
+        <button class="action-btn solid" id="verifyFingerprintBtn" onclick="verifyFingerprint()">I verified this fingerprint</button>
+      </div>
+
       <div class="crypto-info">
         <div><span>ECDH</span> P-256 key exchange</div>
         <div><span>AES-256-GCM</span> encryption</div>
@@ -468,6 +475,13 @@ textarea.token-box:focus { border-color: var(--accent); color: var(--text); }
 // ── State ─────────────────────────────────────────────────
 let pc, dc, myKeyPair, sharedKey;
 const CHUNK_SIZE = 60000;
+const MAX_FILE_SIZE = 25 * 1024 * 1024;
+const MAX_TOTAL_INCOMING = 50 * 1024 * 1024;
+const MAX_ACTIVE_TRANSFERS = 4;
+const MAX_MESSAGE_LENGTH = 10000;
+let pendingPeerFingerprint = null;
+let verifiedPeer = false;
+let incomingBytes = 0;
 
 // ── Sidebar ───────────────────────────────────────────────
 function openSidebar() {
@@ -523,6 +537,7 @@ function log(txt, side = 'system') {
 }
 
 function enableChat() {
+  if (!verifiedPeer) return;
   document.getElementById('msgInput').disabled = false;
   document.getElementById('sendBtn').disabled = false;
   document.getElementById('attachBtn').disabled = false;
@@ -562,6 +577,29 @@ async function deriveShared(theirPubRaw) {
   );
 }
 
+async function fingerprintFor(theirPubRaw) {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', theirPubRaw));
+  return Array.from(digest, b => b.toString(16).padStart(2, '0').toUpperCase()).join('').match(/.{1,4}/g).join(' ');
+}
+
+async function verifyPeerKey(theirPubRaw) {
+  pendingPeerFingerprint = await fingerprintFor(theirPubRaw);
+  verifiedPeer = false;
+  document.getElementById('fingerprintValue').textContent = pendingPeerFingerprint;
+  document.getElementById('fingerprintSection').style.display = 'block';
+  document.getElementById('verifyFingerprintBtn').disabled = false;
+  document.getElementById('encBadge').classList.remove('show');
+  document.getElementById('inputHint').textContent = 'verify the peer fingerprint before chatting';
+}
+
+function verifyFingerprint() {
+  if (!pendingPeerFingerprint || !sharedKey) return;
+  verifiedPeer = true;
+  document.getElementById('fingerprintSection').style.display = 'none';
+  if (dc && dc.readyState === 'open') enableChat();
+  log('peer fingerprint verified by user');
+}
+
 async function encBytes(bytes) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, sharedKey, bytes);
@@ -571,6 +609,7 @@ async function encBytes(bytes) {
 }
 
 async function decBytes(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength < 28 || bytes.byteLength > CHUNK_SIZE + 28) throw new Error('Invalid encrypted packet');
   const iv = bytes.slice(0, 12), ct = bytes.slice(12);
   return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, sharedKey, ct));
 }
@@ -610,7 +649,7 @@ async function startAsInitiator() {
 
   const pubRaw = await crypto.subtle.exportKey('raw', myKeyPair.publicKey);
   await pc.setLocalDescription(await pc.createOffer());
-  await new Promise(r => setTimeout(r, 1500));
+  await waitForIceGathering();
 
   const bundle = { sdp: pc.localDescription, pub: b2b(pubRaw) };
   document.getElementById('offerBox').value = btoa(JSON.stringify(bundle));
@@ -631,13 +670,15 @@ async function startAsResponder() {
 async function processOffer() {
   const raw = document.getElementById('offerInput').value.trim();
   if (!raw) return;
-  const bundle = JSON.parse(atob(raw));
+  const bundle = parseSignal(raw, 'offer');
+  const peerKey = b2u(bundle.pub);
   await pc.setRemoteDescription(new RTCSessionDescription(bundle.sdp));
-  await deriveShared(b2u(bundle.pub));
+  await deriveShared(peerKey);
+  await verifyPeerKey(new Uint8Array(peerKey));
 
   const pubRaw = await crypto.subtle.exportKey('raw', myKeyPair.publicKey);
   await pc.setLocalDescription(await pc.createAnswer());
-  await new Promise(r => setTimeout(r, 1500));
+  await waitForIceGathering();
 
   const bundle2 = { sdp: pc.localDescription, pub: b2b(pubRaw) };
   document.getElementById('answerBox').value = btoa(JSON.stringify(bundle2));
@@ -648,10 +689,36 @@ async function processOffer() {
 async function acceptAnswer() {
   const raw = document.getElementById('answerInput').value.trim();
   if (!raw) return;
-  const bundle = JSON.parse(atob(raw));
+  const bundle = parseSignal(raw, 'answer');
   await pc.setRemoteDescription(new RTCSessionDescription(bundle.sdp));
-  await deriveShared(b2u(bundle.pub));
+  const peerKey = b2u(bundle.pub);
+  await deriveShared(peerKey);
+  await verifyPeerKey(new Uint8Array(peerKey));
   log('ECDH key exchange complete');
+}
+
+function waitForIceGathering() {
+  if (!pc || pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise(resolve => {
+    const timeout = setTimeout(done, 10000);
+    function done() {
+      clearTimeout(timeout);
+      pc.removeEventListener('icegatheringstatechange', onState);
+      resolve();
+    }
+    function onState() { if (pc.iceGatheringState === 'complete') done(); }
+    pc.addEventListener('icegatheringstatechange', onState);
+  });
+}
+
+function parseSignal(raw, expectedType) {
+  if (raw.length > 200000) throw new Error('Signal is too large');
+  let bundle;
+  try { bundle = JSON.parse(atob(raw)); } catch { throw new Error('Invalid connection data'); }
+  if (!bundle || !bundle.sdp || typeof bundle.sdp.sdp !== 'string' || bundle.sdp.type !== expectedType || typeof bundle.pub !== 'string') throw new Error('Invalid connection data');
+  const pub = b2u(bundle.pub);
+  if (pub.byteLength !== 65 || new Uint8Array(pub)[0] !== 4) throw new Error('Invalid peer key');
+  return bundle;
 }
 
 // ── Data Channel ──────────────────────────────────────────
@@ -673,23 +740,33 @@ function setupDC(ch) {
       try { env = JSON.parse(await decText(e.data)); } catch { return; }
 
       if (env.type === 'text') {
-        log(env.v, 'them');
+        if (typeof env.v === 'string' && env.v.length <= MAX_MESSAGE_LENGTH) log(env.v, 'them');
       } else if (env.type === 'start') {
-        incoming[env.id] = { name: env.name, mime: env.mime, size: env.size, chunks: [] };
+        if (!/^[A-Za-z0-9_-]{16}$/.test(env.id) || typeof env.name !== 'string' || env.name.length > 255 || typeof env.mime !== 'string' || env.mime.length > 127 || !Number.isSafeInteger(env.size) || env.size < 0 || env.size > MAX_FILE_SIZE || Object.keys(incoming).length >= MAX_ACTIVE_TRANSFERS || incoming[env.id] || incomingBytes + env.size > MAX_TOTAL_INCOMING) return;
+        incoming[env.id] = { name: env.name.replace(/[\\/\0-\x1f\x7f]/g, '_'), mime: /^[\w.+-]+\/[\w.+-]+$/.test(env.mime) ? env.mime : 'application/octet-stream', size: env.size, received: 0, chunks: [] };
+        incomingBytes += env.size;
       } else if (env.type === 'end') {
         const f = incoming[env.id];
         if (!f) return;
+        if (f.received !== f.size) { incomingBytes -= f.size; delete incoming[env.id]; return; }
         const blob = new Blob(f.chunks, { type: f.mime });
         showIncoming(f.name, f.mime, blob);
+        incomingBytes -= f.size;
         delete incoming[env.id];
-      }
+      } else return;
     } else {
       // Binary: 16-byte ID + encrypted chunk
+      if (!(e.data instanceof ArrayBuffer) || e.data.byteLength < 44 || e.data.byteLength > CHUNK_SIZE + 44) return;
       const idRaw = new Uint8Array(e.data, 0, 16);
       const id = new TextDecoder().decode(idRaw).replace(/\0/g, '');
       const enc = new Uint8Array(e.data, 16);
-      const dec = await decBytes(enc);
-      if (incoming[id]) incoming[id].chunks.push(dec);
+      if (incoming[id]) {
+        const dec = await decBytes(enc);
+        const f = incoming[id];
+        if (f.received + dec.byteLength > f.size) { incomingBytes -= f.size; delete incoming[id]; return; }
+        f.chunks.push(dec);
+        f.received += dec.byteLength;
+      }
     }
   };
 
@@ -700,7 +777,7 @@ function setupDC(ch) {
 async function sendMessage() {
   const inp = document.getElementById('msgInput');
   const txt = inp.value.trim();
-  if (!txt || !dc || dc.readyState !== 'open') return;
+  if (!txt || txt.length > MAX_MESSAGE_LENGTH || !verifiedPeer || !dc || dc.readyState !== 'open') return;
   dc.send(await encText(JSON.stringify({ type: 'text', v: txt })));
   log(txt, 'me');
   inp.value = '';
@@ -718,7 +795,7 @@ function handleFileSelect(e) {
 }
 
 function randId() {
-  return Math.random().toString(36).slice(2, 10).padEnd(16,'0').slice(0,16);
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('').slice(0,16);
 }
 
 function fmtSize(b) {
@@ -728,17 +805,18 @@ function fmtSize(b) {
 }
 
 async function sendFile(file) {
-  if (!dc || dc.readyState !== 'open') return;
+  if (!verifiedPeer || !dc || dc.readyState !== 'open' || file.size > MAX_FILE_SIZE) { log('file rejected: verify peer and choose a file under 25 MB'); return; }
   const id = randId();
-  const isImg = file.type.startsWith('image/');
+  const safeMime = /^[\w.+-]+\/[\w.+-]+$/.test(file.type) ? file.type : 'application/octet-stream';
+  const isImg = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(safeMime);
 
-  dc.send(await encText(JSON.stringify({ type: 'start', id, name: file.name, mime: file.type, size: file.size })));
+  dc.send(await encText(JSON.stringify({ type: 'start', id, name: file.name.slice(0, 255), mime: safeMime, size: file.size })));
 
   // Show sender preview
   const fr = new FileReader();
   fr.onload = ev => {
     if (isImg) addImageMsg(ev.target.result, 'me', file.name);
-    else addFileMsg(file.name, file.type, file.size, null, 'me');
+    else addFileMsg(file.name.slice(0, 255), safeMime, file.size, null, 'me');
   };
   fr.readAsDataURL(file);
 
@@ -761,7 +839,7 @@ async function sendFile(file) {
 }
 
 function showIncoming(name, mime, blob) {
-  if (mime.startsWith('image/')) {
+  if (mime.startsWith('image/') && ['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(mime)) {
     const url = URL.createObjectURL(blob);
     addImageMsg(url, 'them', name);
   } else {
@@ -800,17 +878,18 @@ function addFileMsg(name, mime, size, blob, side) {
     };
     fd.title = 'click to download';
   }
-  fd.innerHTML = `
-    <div class="file-icon">
-      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-        <path d="M4 2h7l4 4v10a1 1 0 01-1 1H4a1 1 0 01-1-1V3a1 1 0 011-1z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
-        <path d="M11 2v4h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
-      </svg>
-    </div>
-    <div>
-      <div class="file-name">${name}</div>
-      <div class="file-size">${fmtSize(size)}${blob ? ' · tap to download' : ' · sending…'}</div>
-    </div>`;
+  const icon = document.createElement('div');
+  icon.className = 'file-icon';
+  icon.innerHTML = '<svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 2h7l4 4v10a1 1 0 01-1 1H4a1 1 0 01-1-1V3a1 1 0 011-1z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M11 2v4h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>';
+  const details = document.createElement('div');
+  const fileName = document.createElement('div');
+  fileName.className = 'file-name';
+  fileName.textContent = name;
+  const fileSize = document.createElement('div');
+  fileSize.className = 'file-size';
+  fileSize.textContent = `${fmtSize(size)}${blob ? ' · tap to download' : ' · sending…'}`;
+  details.append(fileName, fileSize);
+  fd.append(icon, details);
   wrap.appendChild(fd);
   const meta = document.createElement('div');
   meta.className = 'msg-meta';
@@ -821,3 +900,4 @@ function addFileMsg(name, mime, size, blob, side) {
 </script>
 </body>
 </html>
+
